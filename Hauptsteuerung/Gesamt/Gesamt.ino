@@ -1,3 +1,5 @@
+#include <Wire.h>
+
 /*-------PIN-Definitionen-----------------------------------------------------------------*/
 
 // Step-Pin (mit allen Motortreibern verbunden) mit PWM Signal belegt
@@ -11,7 +13,7 @@ const int pinsEnable[] = {46,45,44};
 // Tisch 2 -> Port K: A8-A13
 
 // Periodendauer der Schrittmotoren bei Vorwaertsgang in ms
-const int schrittPeriode = 10;
+const int schrittPeriode = 2;
 // Periodendauer der Sensorabfrageperiode
 const int abtastPeriode = 4;
 const int pinRichtung = 11;
@@ -22,9 +24,10 @@ volatile uint16_t *OCR5[] = {&OCR5A,&OCR5B,&OCR5C};
 const int entprellZyklen = 200;
 int entprellZaehler[3][6] = {0};
 uint8_t Sensorregister[] = {0,0,0};
-const int schrittMaximum = 3000; // Maximale Schrittanzahl bis Tischende
+const int schrittMaximum = 5000; // Maximale Schrittanzahl bis Tischende
 int schrittKonto[3] = {schrittMaximum,schrittMaximum,schrittMaximum};
 const int lochBonus[] = {300,300,300,600,600,1000};
+const int lochReihenfolge [3][6] ={{2,5,1,3,0,4},{0,1,2,3,4,5},{0,1,2,3,4,5}};
 boolean spielBeendet = true;
 int siegerTisch = 3;
 
@@ -46,8 +49,8 @@ Pin 6 muss dafür mit Pin 47 verbunden sein
 */
 int startePWMcounter(void)
 {
-  TCCR5A = (1<<COM5A1) | (1<<COM5A0) | (1<<COM5B1) | (1<<COM5B0) | (1<<COM5C1) | (1<<COM5C0); // Pins 46, 45 und 44 als Enable-Pins verbinden, non-inverting
-  TCCR5A &= ~ ((1<<WGM41) | (1<<WGM40)); // Fast PWM Teil 1 (WGM4 = 14, letzte beiden Bits in TCCR4A)
+  TCCR5A = (1<<COM5A1) | (1<<COM5B1) | (1<<COM5C1); // Pins 46, 45 und 44 als Sleep-Pins verbinden
+  TCCR5A &= ~ ((1<<WGM51) | (1<<WGM50)); // Normal alle WGM5=0
   TCCR5B = (0b110<<CS50); // External clock source (falling edge)
   ICR5 = 0xFFFF; // Input Capture Register maximal
   OCR5A = 0x0001; // Output Compare Register
@@ -76,10 +79,11 @@ void initialisiereSensorpins(void)
   PORTA &= 0xC0;
   PORTF &= 0xC0;
   PORTK &= 0xC0;
-  
-  PORTA = 0xFF; //TODO !!!!!!!!!!!!! NUR ZUM TESTEN: PULLUP AKTIVIERT; später Zeile löschen !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+  PORTA = 0xFF; //TODO !!!!!!!!!!!!! NUR ZUM TESTEN: PULLUP AKTIVIERT !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
   PORTF = 0xFF;
   PORTK = 0xFF;
+
 }
 
 void pruefeLoecher(void)
@@ -100,7 +104,8 @@ void pruefeLoecher(void)
           entprellZaehler[tisch][loch] = entprellZyklen;
           Serial.print(loch);Serial.print(" "); 
           Serial.println(tisch);
-          setzeSchritte(tisch, loch);
+          setzeSchritte(tisch, lochReihenfolge[tisch][loch]);
+          sendeSpielstand(tisch,lochReihenfolge[tisch][loch]);
         }
       }
       else if(entprellZaehler[tisch][loch] > 0)
@@ -129,6 +134,7 @@ void setzeSchritte(int tisch, int loch)
     siegerTisch = tisch;
     spielBeendet = true;
     schrittKonto[tisch] += schrittDifferenz;
+    sendeSpielstand(tisch, 6);
   }
   
   Serial.println(schrittKonto[tisch]);
@@ -148,9 +154,9 @@ void addiereSchritte(int anzahlSchritte, int tisch)
     aktuellerCounterWert = TCNT5;
     *OCR5[tisch] = anzahlSchritte + aktuellerCounterWert;
     // Motor aktivieren
-    TCCR5A &= ~ (0x40 >> (2*tisch)); // Clear on compare match
-    TCCR5C |= (0x80 >> tisch); // Force output compare
     TCCR5A |=  (0xC0 >> (2*tisch)); // Set on compare match
+    TCCR5C |= (0x80 >> tisch); // Force output compare
+    TCCR5A &= ~ (0x40 >> (2*tisch)); // Clear on compare match
     TIFR5 = (0x02 << tisch); //Output Compare Match Flag
   }
   else
@@ -163,25 +169,51 @@ void addiereSchritte(int anzahlSchritte, int tisch)
 void rueckfahrt()
 {
   Serial.println("RWFahrt");
+  
   digitalWrite(pinRichtung, HIGH);
   
   for(int tisch=0; tisch <= 2; tisch ++)
   {
-    addiereSchritte(schrittKonto[tisch]+50, tisch);
+    addiereSchritte(schrittKonto[tisch]*1.025, tisch);
   }
   while((TIFR5 & 0x0E) != 0x0E)
   {
+    
     for(int tisch=0; tisch <= 2; tisch ++)
     {
       if(digitalRead(pinEndlage[tisch]) == 0)
       {
+        //Serial.print("Force kompare irgendwas ganz langes, admit es auffällt");
         // Figur dieses Tisches ist an Endlage angekommen
         TCCR5C |= (0x80 >> tisch); // Force output compare
       }
     }
+    //Serial.println();
   }
   Serial.println("RWFahrt beendet");
   digitalWrite(pinRichtung, LOW);
+}
+
+void sendeSpielstand(int tisch, int loch)
+{
+  //Kodierung: Loch6 --> Siegertisch steht fest
+  //           Loch7 --> Siegertisch angekommen
+  //           Loch6 --> Tisch5 Rückfahrt start
+  //           Loch6 --> Tisch6 Rückfahrt beendet
+  //           Loch7 --> Tisch5 Ampel rot
+  //           Loch7 --> Tisch6 Ampel gelb
+  //           Loch7 --> Tisch7 Ampel grün
+  
+  Wire.beginTransmission(1);  
+  Wire.write(tisch);
+  Wire.write(loch);
+  Wire.write(schrittKonto[0]>>8);
+  Wire.write(schrittKonto[0]);
+  Wire.write(schrittKonto[1]>>8);
+  Wire.write(schrittKonto[1]);
+  Wire.write(schrittKonto[2]>>8);
+  Wire.write(schrittKonto[2]);
+  Wire.endTransmission();  
 }
 
 void setup()
@@ -197,27 +229,38 @@ void setup()
   {
     pinMode(pinsEnable[tisch],OUTPUT);
     pinMode(pinEndlage[tisch], INPUT_PULLUP);
+    //geändert07.04
+    TCCR5A |=  (0xC0 >> (2*tisch)); // Set on compare match
+    TCCR5C |= (0x80 >> tisch); // Force output compare
+    TCCR5A &= ~ (0x40 >> (2*tisch)); // Clear on compare match
+    TIFR5 = (0x02 << tisch); //Output Compare Match Flag    
   }
   
-  
+  Wire.begin();
   Serial.begin(9600);
 }
 
 
 void loop()
 {
-  //Rueckweg
+  //startePWMcounter();
+  
+  sendeSpielstand(5,6); //starte Rückfahrt
   rueckfahrt();
+  sendeSpielstand(6,6); //Rückfahrt beendet
   
   spielBeendet = false;
   for(int tisch=0; tisch <= 2; tisch ++)
   {
     schrittKonto[tisch] = 0;
   }
+
+  sendeSpielstand(5,7); //Ampel rot
+  delay(3000);
+  sendeSpielstand(6,7); //Ampel gelb
+  delay(1000);
+  sendeSpielstand(7,7); //Ampel grün && Spielstart
   
-  
-  //Hinweg
-  startePWMcounter();
   while(! spielBeendet)
   {
     pruefeLoecher();
@@ -228,4 +271,7 @@ void loop()
   while(! (TIFR5 & (0x2 << siegerTisch))){} // Warte solange bis Sieger angekommen ist
   Serial.println(TIFR5);
   TCCR5C |= 0xE0; // Motoren deaktivieren  
+  sendeSpielstand(siegerTisch,7); //Schicke Sieger angekommen
+
+  delay(2000);
 }
